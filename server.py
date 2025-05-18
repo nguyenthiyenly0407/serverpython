@@ -154,7 +154,8 @@ def chat(query):
         "label": matched.get("label", ""),
         "language": matched.get("language", ""),
         "start_char": matched.get("start_char", -1),
-        "end_char": matched.get("end_char", -1)
+        "end_char": matched.get("end_char", -1),
+        "key_answer": matched.get("key_answer","")
     }
 
 # 🌐 API endpoint
