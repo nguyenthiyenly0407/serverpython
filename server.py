@@ -180,11 +180,18 @@ def chatbot_api(data: QuestionRequest):
     if '```' in context or context.strip().startswith(('def ', 'import ')):
         return {
             "your_question": query,
-            "matched_question": matched.get("question", ""),
+            "matched_question": matched["question"],
             "context_used": context,
-            "final_answer": context,
+            "bert_generated_answer": context,
+            "original_answer": matched["answer"],
+            "label": matched.get("label", ""),
+            "language": matched.get("language", ""),
+            "start_char": matched.get("start_char", -1),
+            "end_char": matched.get("end_char", -1),
+            "key_answer": matched.get("key_answer",""),
             "used_paraphrase": False
         }
+       
 
     # Step 2: QA prediction
     inputs = qa_tokenizer(query, context, return_tensors="pt", truncation=True, max_length=512).to(device)
@@ -202,11 +209,16 @@ def chatbot_api(data: QuestionRequest):
 
     return {
         "your_question": query,
-        "matched_question": matched.get("question", ""),
+        "matched_question": matched["question"],
         "context_used": context,
-        "final_answer": final_para,
-        "used_paraphrase": True,
-        "original_answer": answer
+        "bert_generated_answer": final_para,
+        "original_answer": matched["answer"],
+        "label": matched.get("label", ""),
+        "language": matched.get("language", ""),
+        "start_char": matched.get("start_char", -1),
+        "end_char": matched.get("end_char", -1),
+        "key_answer": matched.get("key_answer",""),
+        "used_paraphrase": True
     }
 
 if __name__ == "__main__":
