@@ -93,14 +93,12 @@ import json
 import numpy as np
 import faiss
 import torch
-from sentence_transformers import SentenceTransformer, util
+from sentence_transformers import SentenceTransformer
 from transformers import (
-    AutoTokenizer,
-    EncoderDecoderModel,
-    BartTokenizer,
-    BartForConditionalGeneration,
     BertTokenizerFast,
-    BertForQuestionAnswering
+    BertForQuestionAnswering,
+    BartTokenizer,
+    BartForConditionalGeneration
 )
 
 # 🚀 Khởi tạo FastAPI
@@ -123,67 +121,47 @@ index.add(q_embs)
 id_to_sample = {i: item for i, item in enumerate(dataset)}
 
 # -------------------------------
-# 3) Paraphrase pipeline: BERT2BERT primary + BART fallback
+# 3) Load QA model (yenly1234/BERTQAEN)
 # -------------------------------
-bert_ckpt = "yenly1234/BERTQAEN"
-# Encoder-decoder model uses same tokenizer
-bert_tokenizer = AutoTokenizer.from_pretrained(bert_ckpt)
-bert2bert = EncoderDecoderModel.from_encoder_decoder_pretrained(bert_ckpt, bert_ckpt)
-# configure special tokens
-decoder_start = bert_tokenizer.bos_token_id or bert_tokenizer.cls_token_id
-# Ensure both decoder_start_token_id and bos_token_id are set
-bert2bert.config.decoder_start_token_id = decoder_start
-bert2bert.config.bos_token_id = decoder_start
-bert2bert.config.eos_token_id = bert_tokenizer.sep_token_id
-bert2bert.config.pad_token_id = bert_tokenizer.pad_token_id
-bert2bert.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+qa_tokenizer = BertTokenizerFast.from_pretrained("yenly1234/BERTQAEN")
+qa_model = BertForQuestionAnswering.from_pretrained("yenly1234/BERTQAEN")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+qa_model.to(device)
 
+# -------------------------------
+# 4) Load BART for paraphrase
+# -------------------------------
 bart_tok = BartTokenizer.from_pretrained("facebook/bart-large")
 bart_model = BartForConditionalGeneration.from_pretrained("facebook/bart-large")
-bart_model.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+bart_model.to(device)
 
-# generate with BART fallback
-def generate_with_bart(text: str) -> str:
-    inp = bart_tok(f"paraphrase: {text}", return_tensors="pt", truncation=True, max_length=256).to(bart_model.device)
+def generate_with_bart(text: str, attempts: int = 5) -> str:
+    """
+    Generate paraphrase with BART: sample multiple candidates, using beam sampling for diversity.
+    """
+    inp = bart_tok(f"paraphrase: {text}", return_tensors="pt", truncation=True, max_length=256).to(device)
     out = bart_model.generate(
         **inp,
         do_sample=True,
         top_k=50,
         top_p=0.95,
-        temperature=1.0,
-        num_return_sequences=1,
+        temperature=1.5,
+        num_return_sequences=attempts,
+        num_beams=attempts,
         max_length=256,
         no_repeat_ngram_size=3
     )
-    para = bart_tok.decode(out[0], skip_special_tokens=True).strip()
-    if para.lower().startswith("paraphrase:"):
-        para = para.split(":",1)[1].strip()
-    return para
-
-# generate with BERT2BERT
-def generate_paraphrase_with_bert2bert(text: str) -> str:
-    enc = bert_tokenizer(text, return_tensors="pt", padding="max_length", truncation=True, max_length=128).to(bert2bert.device)
-    out_ids = bert2bert.generate(
-        input_ids=enc.input_ids,
-        attention_mask=enc.attention_mask,
-        decoder_start_token_id=bert2bert.config.decoder_start_token_id,
-        bos_token_id=bert2bert.config.bos_token_id,
-        eos_token_id=bert2bert.config.eos_token_id,
-        pad_token_id=bert2bert.config.pad_token_id,
-        max_length=128,
-        num_beams=4,
-        do_sample=True,
-        top_k=50,
-        top_p=0.9,
-        repetition_penalty=1.5,
-        no_repeat_ngram_size=3,
-        num_return_sequences=1
-    )
-    para = bert_tokenizer.decode(out_ids[0], skip_special_tokens=True).strip()
-    return para
+    candidates = [bart_tok.decode(o, skip_special_tokens=True).strip() for o in out]
+    def clean(p: str) -> str:
+        return p.replace("paraphrase:", "", 1).strip()
+    variants = [clean(p) for p in candidates]
+    for v in variants:
+        if v and v.lower() != text.lower():
+            return v
+    return variants[0] if variants else text
 
 # -------------------------------
-# 4) FastAPI chat logic
+# 5) FastAPI chat logic
 # -------------------------------
 class QuestionRequest(BaseModel):
     question: str
@@ -191,39 +169,59 @@ class QuestionRequest(BaseModel):
 @app.post("/chat")
 def chatbot_api(data: QuestionRequest):
     query = data.question
-    # Retrieval
+    # Step 1: semantic retrieval
     q_vec = embed_model.encode(query, convert_to_numpy=True, normalize_embeddings=True).reshape(1, -1)
-    D, I = index.search(q_vec, 5)
+    _, I = index.search(q_vec, 5)
     best_idx = int(I[0][0])
     matched = id_to_sample[best_idx]
-    base_answer = matched.get("answer", "")
-    # Decide whether to paraphrase
-    if '```' in base_answer or base_answer.strip().startswith('def ') or base_answer.strip().startswith('import '):
-        # Contains code: return original
-        final_answer = base_answer
-        used_paraphrase = False
-    else:
-        # No code: paraphrase answer
-        para = generate_paraphrase_with_bert2bert(base_answer)
-        # semantic check
-        orig_emb = embed_model.encode(base_answer, convert_to_numpy=True, normalize_embeddings=True)
-        para_emb = embed_model.encode(para, convert_to_numpy=True, normalize_embeddings=True)
-        sim = float(np.dot(orig_emb, para_emb))
-        if len(para.split()) < len(base_answer.split()) * 0.6 or sim < 0.7:
-            para = generate_with_bart(base_answer)
-        final_answer = para
-        used_paraphrase = True
+    context = matched.get("answer", "")
 
-    # Return response
+    # If context contains code, return it directly
+    if '```' in context or context.strip().startswith(('def ', 'import ')):
+        return {
+            "your_question": query,
+            "matched_question": matched["question"],
+            "context_used": context,
+            "bert_generated_answer": context,
+            "original_answer": matched["answer"],
+            "label": matched.get("label", ""),
+            "language": matched.get("language", ""),
+            "start_char": matched.get("start_char", -1),
+            "end_char": matched.get("end_char", -1),
+            "key_answer": matched.get("key_answer",""),
+            "used_paraphrase": False
+        }
+       
+
+    # Step 2: QA prediction
+    inputs = qa_tokenizer(query, context, return_tensors="pt", truncation=True, max_length=512).to(device)
+    with torch.no_grad():
+        outputs = qa_model(**inputs)
+    start = torch.argmax(outputs.start_logits)
+    end = torch.argmax(outputs.end_logits)
+    if end < start:
+        end = start
+    answer_ids = inputs.input_ids[0][start:end+1]
+    answer = qa_tokenizer.decode(answer_ids, skip_special_tokens=True)
+
+    # Step 3: Paraphrase with BART
+    final_para = generate_with_bart(answer)
+
     return {
         "your_question": query,
-        "matched_question": matched.get("question", ""),
-        "context_used": matched.get("context", matched.get("answer", "")),
-        "final_answer": final_answer,
-        "used_paraphrase": used_paraphrase,
-        "original_answer": base_answer
+        "matched_question": matched["question"],
+        "context_used": context,
+        "bert_generated_answer": final_para,
+        "original_answer": matched["answer"],
+        "label": matched.get("label", ""),
+        "language": matched.get("language", ""),
+        "start_char": matched.get("start_char", -1),
+        "end_char": matched.get("end_char", -1),
+        "key_answer": matched.get("key_answer",""),
+        "used_paraphrase": True
     }
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
