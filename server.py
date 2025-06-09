@@ -224,7 +224,11 @@
 # if __name__ == "__main__":
 #     import uvicorn
 #     uvicorn.run(app, host="0.0.0.0", port=8000)
+<<<<<<< HEAD
 from fastapi import FastAPI, UploadFile, File, HTTPException
+=======
+from fastapi import FastAPI
+>>>>>>> origin/master
 from pydantic import BaseModel
 import json
 import numpy as np
@@ -242,11 +246,14 @@ from transformers import (
     AutoTokenizer, AutoModelForSeq2SeqLM
 )
 from langdetect import detect
+<<<<<<< HEAD
 import whisper
 # Khởi tạo FastAPIAdd commentMore actions
 import tempfile
 import os
 import subprocess
+=======
+>>>>>>> origin/master
 
 # Cấu hình lại đường dẫn ffmpeg nếu không có trong PATH
 CUSTOM_FFMPEG_PATH = "./tool/ffmpeg.exe"  # hoặc absolute path
