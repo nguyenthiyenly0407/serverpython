@@ -224,7 +224,7 @@
 # if __name__ == "__main__":
 #     import uvicorn
 #     uvicorn.run(app, host="0.0.0.0", port=8000)
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
 import json
 import numpy as np
@@ -242,7 +242,15 @@ from transformers import (
     AutoTokenizer, AutoModelForSeq2SeqLM
 )
 from langdetect import detect
+import whisper
+# Khởi tạo FastAPIAdd commentMore actions
+import tempfile
+import os
+import subprocess
 
+# Cấu hình lại đường dẫn ffmpeg nếu không có trong PATH
+CUSTOM_FFMPEG_PATH = "./tool/ffmpeg.exe"  # hoặc absolute path
+os.environ["PATH"] += os.pathsep + os.path.dirname(CUSTOM_FFMPEG_PATH)
 # 🚀 Khởi tạo FastAPI
 app = FastAPI()
 
@@ -392,6 +400,27 @@ def chatbot_api(data: QuestionRequest):
         "key_answer": matched.get("key_answer",""),
         "used_paraphrase": True
     }
+whisper_model = whisper.load_model("medium")
+@app.post("/stt")
+async def speech_to_text(audio: UploadFile = File(...)):
+    suffix = audio.filename.split('.')[-1]
+    tmp_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{suffix}") as tmp:
+            tmp.write(await audio.read())
+            tmp.flush()
+            tmp_path = tmp.name
+
+        result = whisper_model.transcribe(tmp_path)
+        return {"text": result["text"]}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi xử lý âm thanh: {str(e)}")
+
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 if __name__ == "__main__":
     import uvicorn
