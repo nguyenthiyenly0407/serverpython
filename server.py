@@ -239,19 +239,19 @@ from transformers import (
     XLMRobertaForQuestionAnswering,
     BartTokenizer,
     BartForConditionalGeneration,
-    AutoTokenizer, AutoModelForSeq2SeqLM
+    AutoTokenizer, AutoModelForSeq2SeqLM,
+    LongformerTokenizerFast, LongformerForQuestionAnswering
 )
 from langdetect import detect
 import whisper
-# Khởi tạo FastAPIAdd commentMore actions
 import tempfile
 import os
 import subprocess
 
-# Cấu hình lại đường dẫn ffmpeg nếu không có trong PATH
-CUSTOM_FFMPEG_PATH = "./tool/ffmpeg.exe"  # hoặc absolute path
+# Cấu hình ffmpeg nếu cần
+CUSTOM_FFMPEG_PATH = "./tool/ffmpeg.exe"
 os.environ["PATH"] += os.pathsep + os.path.dirname(CUSTOM_FFMPEG_PATH)
-# 🚀 Khởi tạo FastAPI
+
 app = FastAPI()
 
 # -------------------------------
@@ -273,16 +273,19 @@ id_to_sample = {i: item for i, item in enumerate(dataset)}
 # -------------------------------
 # 3) Load QA models
 # -------------------------------
-vi_tokenizer = XLMRobertaTokenizerFast.from_pretrained("yenly1234/XMLBERTVI")
-vi_model = XLMRobertaForQuestionAnswering.from_pretrained("yenly1234/XMLBERTVI").to("cuda" if torch.cuda.is_available() else "cpu")
-
-en_tokenizer = BertTokenizerFast.from_pretrained("yenly1234/BERTQAEN")
-en_model = BertForQuestionAnswering.from_pretrained("yenly1234/BERTQAEN").to("cuda" if torch.cuda.is_available() else "cpu")
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+vi_tokenizer = XLMRobertaTokenizerFast.from_pretrained("yenly1234/XMLBERTVI")
+vi_model = XLMRobertaForQuestionAnswering.from_pretrained("yenly1234/XMLBERTVI").to(device)
+
+en_tokenizer = BertTokenizerFast.from_pretrained("yenly1234/BERTQAEN")
+en_model = BertForQuestionAnswering.from_pretrained("yenly1234/BERTQAEN").to(device)
+
+long_en_tokenizer = LongformerTokenizerFast.from_pretrained("yenly1234/bertqa_longEN")
+long_en_model = LongformerForQuestionAnswering.from_pretrained("yenly1234/bertqa_longEN").to(device)
+
 # -------------------------------
-# 4) Load BART for paraphrase
+# 4) Load BART for paraphrasing
 # -------------------------------
 bart_tokenizer = AutoTokenizer.from_pretrained("facebook/bart-large")
 bart_model = AutoModelForSeq2SeqLM.from_pretrained("facebook/bart-large")
@@ -290,16 +293,20 @@ bart_model = AutoModelForSeq2SeqLM.from_pretrained("facebook/bart-large")
 bartpho_tokenizer = AutoTokenizer.from_pretrained("vinai/bartpho-word")
 bartpho_model = AutoModelForSeq2SeqLM.from_pretrained("vinai/bartpho-word")
 
+# -------------------------------
+# Helper functions
+# -------------------------------
 def detect_language(text):
     try:
-        lang = detect(text)
-        return lang
+        return detect(text)
     except:
         return "unknown"
 
+def is_vietnamese(text):
+    return bool(re.search(r"[\u00C0-\u1EF9]", text))
+
 def generate_paraphrase(text, max_length=256):
     lang = detect_language(text)
-
     if lang == "en":
         tokenizer = bart_tokenizer
         model = bart_model
@@ -326,15 +333,8 @@ def generate_paraphrase(text, max_length=256):
         )
     return tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-
 # -------------------------------
-# 5) Helper: detect if text is Vietnamese
-# -------------------------------
-def is_vietnamese(text):
-    return bool(re.search(r"[\u00C0-\u1EF9]", text))
-
-# -------------------------------
-# 6) FastAPI chat logic
+# 6) Chat API
 # -------------------------------
 class QuestionRequest(BaseModel):
     question: str
@@ -343,21 +343,21 @@ class QuestionRequest(BaseModel):
 def chatbot_api(data: QuestionRequest):
     query = data.question
 
-    # Detect language
+    # Step 1: Detect language
     if is_vietnamese(query):
-        qa_model, qa_tokenizer = vi_model, vi_tokenizer
         language = "vi"
+        qa_model, qa_tokenizer = vi_model, vi_tokenizer
     else:
-        qa_model, qa_tokenizer = en_model, en_tokenizer
         language = "en"
 
-    # Step 1: semantic retrieval
+    # Step 2: Retrieve top match
     q_vec = embed_model.encode(query, convert_to_numpy=True, normalize_embeddings=True).reshape(1, -1)
     _, I = index.search(q_vec, 5)
     best_idx = int(I[0][0])
     matched = id_to_sample[best_idx]
     context = matched.get("answer", "")
 
+    # Nếu là code, trả luôn context
     if '```' in context or context.strip().startswith(('def ', 'import ')):
         return {
             "your_question": query,
@@ -369,22 +369,31 @@ def chatbot_api(data: QuestionRequest):
             "language": language,
             "start_char": matched.get("start_char", -1),
             "end_char": matched.get("end_char", -1),
-            "key_answer": matched.get("key_answer",""),
+            "key_answer": matched.get("key_answer", ""),
             "used_paraphrase": False
         }
 
-    # Step 2: QA prediction
-    inputs = qa_tokenizer(query, context, return_tensors="pt", truncation=True, max_length=512).to(device)
+    # Step 3: Chọn model theo context
+    if language == "en":
+        if len(context) > 512:
+            qa_model, qa_tokenizer = long_en_model, long_en_tokenizer
+            max_length = 4096
+        else:
+            qa_model, qa_tokenizer = en_model, en_tokenizer
+            max_length = 512
+
+    # Step 4: QA prediction
+    inputs = qa_tokenizer(query, context, return_tensors="pt", truncation=True, max_length=max_length).to(device)
     with torch.no_grad():
         outputs = qa_model(**inputs)
     start = torch.argmax(outputs.start_logits)
     end = torch.argmax(outputs.end_logits)
     if end < start:
         end = start
-    answer_ids = inputs.input_ids[0][start:end+1]
+    answer_ids = inputs.input_ids[0][start:end + 1]
     answer = qa_tokenizer.decode(answer_ids, skip_special_tokens=True)
 
-    # Step 3: Paraphrase with BART
+    # Step 5: Paraphrase
     final_para = generate_paraphrase(answer)
 
     return {
@@ -397,15 +406,19 @@ def chatbot_api(data: QuestionRequest):
         "language": language,
         "start_char": matched.get("start_char", -1),
         "end_char": matched.get("end_char", -1),
-        "key_answer": matched.get("key_answer",""),
+        "key_answer": matched.get("key_answer", ""),
         "used_paraphrase": True
     }
+
+# -------------------------------
+# 7) Speech-to-text (STT)
+# -------------------------------
 whisper_model = whisper.load_model("medium")
+
 @app.post("/stt")
 async def speech_to_text(audio: UploadFile = File(...)):
     suffix = audio.filename.split('.')[-1]
     tmp_path = None
-
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=f".{suffix}") as tmp:
             tmp.write(await audio.read())
@@ -422,8 +435,9 @@ async def speech_to_text(audio: UploadFile = File(...)):
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
 
+# -------------------------------
+# Run
+# -------------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
