@@ -248,10 +248,15 @@ import tempfile
 import os
 import subprocess
 
+# -------------------------------
 # Cấu hình ffmpeg nếu cần
+# -------------------------------
 CUSTOM_FFMPEG_PATH = "./tool/ffmpeg.exe"
 os.environ["PATH"] += os.pathsep + os.path.dirname(CUSTOM_FFMPEG_PATH)
 
+# -------------------------------
+# Khởi tạo FastAPI
+# -------------------------------
 app = FastAPI()
 
 # -------------------------------
@@ -343,19 +348,29 @@ class QuestionRequest(BaseModel):
 def chatbot_api(data: QuestionRequest):
     query = data.question
 
-    # Step 1: Detect language
-    if is_vietnamese(query):
-        language = "vi"
-        qa_model, qa_tokenizer = vi_model, vi_tokenizer
-    else:
-        language = "en"
-
     # Step 2: Retrieve top match
     q_vec = embed_model.encode(query, convert_to_numpy=True, normalize_embeddings=True).reshape(1, -1)
     _, I = index.search(q_vec, 5)
     best_idx = int(I[0][0])
     matched = id_to_sample[best_idx]
     context = matched.get("answer", "")
+
+    # Step 1: Detect language and select model
+    if is_vietnamese(query):
+        language = "vi"
+        qa_model = vi_model
+        qa_tokenizer = vi_tokenizer
+        max_length = 512
+    else:
+        language = "en"
+        if len(context) > 512:
+            qa_model = long_en_model
+            qa_tokenizer = long_en_tokenizer
+            max_length = 4096
+        else:
+            qa_model = en_model
+            qa_tokenizer = en_tokenizer
+            max_length = 512
 
     # Nếu là code, trả luôn context
     if '```' in context or context.strip().startswith(('def ', 'import ')):
@@ -372,15 +387,6 @@ def chatbot_api(data: QuestionRequest):
             "key_answer": matched.get("key_answer", ""),
             "used_paraphrase": False
         }
-
-    # Step 3: Chọn model theo context
-    if language == "en":
-        if len(context) > 512:
-            qa_model, qa_tokenizer = long_en_model, long_en_tokenizer
-            max_length = 4096
-        else:
-            qa_model, qa_tokenizer = en_model, en_tokenizer
-            max_length = 512
 
     # Step 4: QA prediction
     inputs = qa_tokenizer(query, context, return_tensors="pt", truncation=True, max_length=max_length).to(device)
@@ -436,8 +442,9 @@ async def speech_to_text(audio: UploadFile = File(...)):
             os.remove(tmp_path)
 
 # -------------------------------
-# Run
+# Run app
 # -------------------------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
